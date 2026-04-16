@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.*
+img2pdf
+qrcode[pil]
+Pillow
+uvicorn
+starlette
