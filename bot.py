@@ -1,403 +1,299 @@
 import os
 import logging
-import asyncio
-import img2pdf
-import qrcode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from PIL import Image, ImageDraw, ImageFont
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, 
-    filters, ConversationHandler
-)
+import qrcode
+import io
+import requests
+from dotenv import load_dotenv
 
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO)
+# Load environment variables
+load_dotenv()
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is not set!")
+# Store user sessions for PDF collection
+user_sessions = {}
 
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
-PORT = int(os.environ.get("PORT", 8000))
-
-# --- Conversation States ---
-TEXT_WAITING = 1      # Waiting for text to convert to image
-QR_WAITING = 2        # Waiting for link to convert to QR code
-IMG_TO_QR_WAITING = 3 # Waiting for image to extract QR content
-
-# --- Store data for each user ---
-user_sessions = {}      # For image→PDF: stores list of image paths
-text_sessions = {}      # For text→image: stores temporary state
-qr_sessions = {}        # For link→QR: stores temporary state
-img_to_qr_sessions = {} # For image→QR: stores temporary state
-
-# --- Helper Function: Text to Image ---
-def create_text_image(text: str, output_path: str, width: int = 800, height: int = 600):
-    """Creates an image with the given text centered on a colored background."""
-    colors = [
-        (41, 128, 185),   # Blue
-        (39, 174, 96),    # Green
-        (192, 57, 43),    # Red
-        (142, 68, 173),   # Purple
-        (230, 126, 34),   # Orange
-    ]
-    bg_color = colors[hash(text) % len(colors)]
-    
-    image = Image.new('RGB', (width, height), color=bg_color)
-    draw = ImageDraw.Draw(image)
-    
-    try:
-        font = ImageFont.load_default()
-    except:
-        font = ImageFont.load_default()
-    
-    # Word wrap function
-    def wrap_text(text, font, max_width):
-        lines = []
-        words = text.split()
-        current_line = []
-        
-        for word in words:
-            test_line = ' '.join(current_line + [word])
-            bbox = draw.textbbox((0, 0), test_line, font=font)
-            if bbox[2] - bbox[0] <= max_width:
-                current_line.append(word)
-            else:
-                if current_line:
-                    lines.append(' '.join(current_line))
-                current_line = [word]
-        
-        if current_line:
-            lines.append(' '.join(current_line))
-        return lines
-    
-    max_width = width - 100
-    lines = wrap_text(text, font, max_width)
-    
-    line_height = 20
-    total_height = len(lines) * line_height
-    y_start = (height - total_height) // 2
-    
-    for i, line in enumerate(lines):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_width = bbox[2] - bbox[0]
-        x = (width - text_width) // 2
-        y = y_start + i * line_height
-        draw.text((x, y), line, fill=(255, 255, 255), font=font)
-    
-    draw.rectangle([0, 0, width-1, height-1], outline=(255, 255, 255), width=3)
-    image.save(output_path)
-    return output_path
-
-# --- Helper Function: Link to QR Code ---
-def create_qr_code(data: str, output_path: str, box_size: int = 10, border: int = 4):
-    """Creates a QR code image from given data."""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=box_size,
-        border=border,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    
-    qr_image = qr.make_image(fill_color="black", back_color="white")
-    qr_image.save(output_path)
-    return output_path
-
-# --- Bot Handlers ---
-
-# ===== START COMMAND =====
+# Start command - WITH REDIRECT WELCOME MESSAGE
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.first_name
+    
+    # Create inline keyboard button for the sports channel
+    keyboard = [
+        [InlineKeyboardButton("🔥 JOIN SPORTS COMMUNITY 🔥", url="https://t.me/nba_nfl_mlb_basketball_bets")],
+        [InlineKeyboardButton("⚡ CONTINUE TO BOT ⚡", callback_data="continue_to_bot")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Welcome message with redirect
+    welcome_text = f"""
+👋 Welcome {username}!
+
+📊 *Sports Discussion & Match Analysis*
+
+Join an active community of sports fans!
+
+⚽ 🏀 🏈 ⚾ 🎾
+
+`-18+ | For entertainment purposes only`
+
+---
+🛠️ *Bot Features available after joining:*
+• Images to PDF
+• Text to Image  
+• Link to QR Code
+• Image to QR Code
+"""
+    
     await update.message.reply_text(
-        "🛠️ *Multi-Utility Bot*\n\n"
-        "I can perform the following tasks:\n\n"
-        "📸 *Images to PDF*\n"
-        "   Send me images one by one, then use /done\n\n"
-        "📝 *Text to Image*\n"
-        "   Use /text2image\n\n"
-        "🔗 *Link to QR Code*\n"
-        "   Use /qr\n\n"
-        "🖼️ *Image to QR Code*\n"
-        "   Use /img2qr to extract text/links from an image\n\n"
-        "Use /cancel to abort any operation."
+        welcome_text, 
+        parse_mode='Markdown',
+        reply_markup=reply_markup
     )
 
-# ===== IMAGE TO PDF COMMANDS =====
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_sessions:
-        user_sessions[user_id] = []
+# Handle button callback
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "continue_to_bot":
+        bot_features = """
+🛠️ *Multi-Utility Bot - Now Active!*
 
-    photo_file = await update.message.photo[-1].get_file()
-    file_path = f"temp_{user_id}_{update.message.message_id}.jpg"
-    await photo_file.download_to_drive(file_path)
-    user_sessions[user_id].append(file_path)
-    
-    await update.message.reply_text(
-        f"✅ Image {len(user_sessions[user_id])} added. Send more or /done."
-    )
+Here's what I can do for you:
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    image_paths = user_sessions.get(user_id, [])
-    
-    if not image_paths:
-        await update.message.reply_text("⚠️ No images to convert. Send me some images first!")
-        return
+📸 *Images to PDF*
+   Send me images one by one, then use /done
 
-    await update.message.reply_text("🔄 Generating your PDF...")
-    pdf_path = f"output_{user_id}.pdf"
-    
-    try:
-        with open(pdf_path, "wb") as f:
-            f.write(img2pdf.convert(image_paths))
-        
-        with open(pdf_path, 'rb') as pdf_file:
-            await update.message.reply_document(
-                document=pdf_file,
-                filename=f"converted_{len(image_paths)}_pages.pdf",
-                caption=f"✅ PDF with {len(image_paths)} page(s) ready!"
-            )
-        
-        # Cleanup
-        for path in image_paths:
-            if os.path.exists(path):
-                os.remove(path)
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
-            
-    except Exception as e:
-        logger.error(f"PDF error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-    
-    user_sessions[user_id] = []
+📝 *Text to Image*
+   Use /text2image <your text>
 
-# ===== TEXT TO IMAGE COMMANDS =====
-async def text2image_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text_sessions[user_id] = True
-    await update.message.reply_text(
-        "📝 Send me the text (max 500 characters). Use /cancel to abort."
-    )
-    return TEXT_WAITING
+🔗 *Link to QR Code*
+   Use /qr <your link>
 
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    if len(text) > 500:
-        await update.message.reply_text("⚠️ Text too long. Please send shorter text.")
-        return TEXT_WAITING
-    
-    await update.message.reply_text("🎨 Creating image...")
-    image_path = f"text_image_{user_id}.png"
-    
-    try:
-        create_text_image(text, image_path)
-        with open(image_path, 'rb') as img_file:
-            await update.message.reply_photo(
-                photo=img_file,
-                caption=f"✅ Image created from your text!"
-            )
-        if os.path.exists(image_path):
-            os.remove(image_path)
-    except Exception as e:
-        logger.error(f"Text-to-image error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-    
-    if user_id in text_sessions:
-        del text_sessions[user_id]
-    return ConversationHandler.END
+🖼️ *Image to QR Code*
+   Send me an image with QR code
 
-# ===== LINK TO QR CODE COMMANDS =====
-async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    qr_sessions[user_id] = True
-    await update.message.reply_text(
-        "🔗 Send me a link (starting with http:// or https://) or any text to convert to QR code.\n"
-        "Use /cancel to abort."
-    )
-    return QR_WAITING
+Use /cancel to abort any operation.
 
-async def receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data = update.message.text.strip()
-    
-    await update.message.reply_text("🔳 Generating QR code...")
-    qr_path = f"qr_code_{user_id}.png"
-    
-    try:
-        create_qr_code(data, qr_path)
-        with open(qr_path, 'rb') as img_file:
-            await update.message.reply_photo(
-                photo=img_file,
-                caption=f"✅ QR code for:\n{data[:100]}{'...' if len(data)>100 else ''}"
-            )
-        if os.path.exists(qr_path):
-            os.remove(qr_path)
-    except Exception as e:
-        logger.error(f"QR error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-    
-    if user_id in qr_sessions:
-        del qr_sessions[user_id]
-    return ConversationHandler.END
+⚠️ *Reminder:* Join our sports community for match analysis!
+👉 @nba_nfl_mlb_basketball_bets
+"""
+        await query.edit_message_text(bot_features, parse_mode='Markdown')
 
-# ===== IMAGE TO QR CODE (Extract content from image) =====
-async def img2qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    img_to_qr_sessions[user_id] = True
-    await update.message.reply_text(
-        "🖼️ Send me an image containing a QR code or text.\n"
-        "I'll extract the content and generate a new QR code from it!\n"
-        "Use /cancel to abort."
-    )
-    return IMG_TO_QR_WAITING
-
-async def receive_image_for_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    await update.message.reply_text("🔍 Processing image...")
-    
-    try:
-        # Download the image
-        photo_file = await update.message.photo[-1].get_file()
-        img_path = f"img_for_qr_{user_id}.jpg"
-        await photo_file.download_to_drive(img_path)
-        
-        # For this version, we'll create a QR code containing image metadata
-        # You can later add OCR (Tesseract) or QR scanning (pyzbar) for actual extraction
-        
-        # Generate metadata QR
-        from datetime import datetime
-        metadata = f"Image processed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        metadata += f"File: {img_path}\n"
-        metadata += "Add OCR library for text extraction from images!"
-        
-        qr_path = f"qr_from_img_{user_id}.png"
-        create_qr_code(metadata, qr_path)
-        
-        with open(qr_path, 'rb') as img_file:
-            await update.message.reply_photo(
-                photo=img_file,
-                caption="✅ QR code generated from image metadata!\n"
-                        "💡 To extract actual QR/text from images, install pyzbar and pytesseract."
-            )
-        
-        # Cleanup
-        if os.path.exists(img_path):
-            os.remove(img_path)
-        if os.path.exists(qr_path):
-            os.remove(qr_path)
-            
-    except Exception as e:
-        logger.error(f"Image-to-QR error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-    
-    if user_id in img_to_qr_sessions:
-        del img_to_qr_sessions[user_id]
-    return ConversationHandler.END
-
-# ===== CANCEL COMMAND =====
+# Cancel command
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # Clean up all sessions
     if user_id in user_sessions:
-        for path in user_sessions[user_id]:
-            if os.path.exists(path):
-                os.remove(path)
         del user_sessions[user_id]
-    
-    for session_dict in [text_sessions, qr_sessions, img_to_qr_sessions]:
-        if user_id in session_dict:
-            del session_dict[user_id]
-    
-    await update.message.reply_text("❌ Operation cancelled. All data cleared.")
-    return ConversationHandler.END
+    await update.message.reply_text("✅ Operation cancelled.")
 
-# --- Webhook and Server Setup ---
-async def main():
-    app = Application.builder().token(TOKEN).updater(None).build()
+# Handle images for PDF
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
-    # Text-to-image conversation
-    text_conv = ConversationHandler(
-        entry_points=[CommandHandler("text2image", text2image_start)],
-        states={
-            TEXT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {'mode': 'collecting_images', 'images': []}
     
-    # Link-to-QR conversation
-    qr_conv = ConversationHandler(
-        entry_points=[CommandHandler("qr", qr_start)],
-        states={
-            QR_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    if user_sessions[user_id].get('mode') == 'collecting_images':
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        user_sessions[user_id]['images'].append(photo_bytes)
+        await update.message.reply_text(f"✅ Image {len(user_sessions[user_id]['images'])} received. Send more or use /done")
+
+# Create PDF from collected images
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
-    # Image-to-QR conversation
-    img2qr_conv = ConversationHandler(
-        entry_points=[CommandHandler("img2qr", img2qr_start)],
-        states={
-            IMG_TO_QR_WAITING: [MessageHandler(filters.PHOTO, receive_image_for_qr)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    if user_id not in user_sessions or not user_sessions[user_id].get('images'):
+        await update.message.reply_text("❌ No images to convert. Send images first, then use /done")
+        return
     
-    # Add all handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(text_conv)
-    app.add_handler(qr_conv)
-    app.add_handler(img2qr_conv)
+    images = user_sessions[user_id]['images']
+    await update.message.reply_text(f"📝 Converting {len(images)} images to PDF...")
     
-    # Set webhook
-    if RENDER_URL:
-        webhook_path = "/telegram"
-        await app.bot.set_webhook(url=f"{RENDER_URL}{webhook_path}")
-        logger.info(f"✅ Webhook set to {RENDER_URL}{webhook_path}")
+    try:
+        pdf_images = []
+        for img_bytes in images:
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode == 'RGBA':
+                img = img.convert('RGB')
+            pdf_images.append(img)
+        
+        pdf_bytes = io.BytesIO()
+        pdf_images[0].save(pdf_bytes, format='PDF', save_all=True, append_images=pdf_images[1:])
+        pdf_bytes.seek(0)
+        
+        await update.message.reply_document(
+            document=pdf_bytes,
+            filename='converted.pdf',
+            caption=f"✅ Converted {len(images)} images to PDF"
+        )
+        
+        del user_sessions[user_id]
+        
+        # Add reminder about sports channel
+        await update.message.reply_text(
+            "⚡ *Enjoyed this?* Join our sports community for more!\n👉 @nba_nfl_mlb_basketball_bets",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"PDF creation error: {e}")
+        await update.message.reply_text("❌ Failed to create PDF. Please try again.")
+
+# Text to Image
+async def text2image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Please provide text. Usage: /text2image <your text>")
+        return
     
-    # Starlette server
-    async def telegram_webhook(request: Request):
+    text = ' '.join(context.args)
+    await update.message.reply_text(f"🖼️ Converting to image...")
+    
+    try:
+        img = Image.new('RGB', (800, 400), color='white')
+        draw = ImageDraw.Draw(img)
+        
         try:
-            data = await request.json()
-            update = Update.de_json(data, app.bot)
-            await app.update_queue.put(update)
-            return Response(status_code=200)
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-            return Response(status_code=500)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        except:
+            try:
+                font = ImageFont.truetype("arial.ttf", 24)
+            except:
+                font = ImageFont.load_default()
+        
+        # Word wrap
+        words = text.split()
+        lines = []
+        current_line = []
+        for word in words:
+            current_line.append(word)
+            line_text = ' '.join(current_line)
+            bbox = draw.textbbox((0, 0), line_text, font=font)
+            if bbox[2] - bbox[0] > 750:
+                current_line.pop()
+                lines.append(' '.join(current_line))
+                current_line = [word]
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        y = 50
+        for line in lines:
+            draw.text((50, y), line, fill='black', font=font)
+            y += 35
+        
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        
+        await update.message.reply_photo(
+            photo=img_bytes,
+            caption="✅ Text converted to image"
+        )
+        
+    except Exception as e:
+        logger.error(f"Text2Image error: {e}")
+        await update.message.reply_text("❌ Failed to convert text to image")
 
-    async def health_check(_: Request):
-        return PlainTextResponse("OK")
-
-    starlette_app = Starlette(routes=[
-        Route("/telegram", telegram_webhook, methods=["POST"]),
-        Route("/healthcheck", health_check, methods=["GET"]),
-    ])
-
-    logger.info(f"🚀 Starting server on port {PORT}...")
-    import uvicorn
-    webserver = uvicorn.Server(
-        uvicorn.Config(starlette_app, host="0.0.0.0", port=PORT, log_level="info")
-    )
+# Generate QR from text/link
+async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Please provide text/link. Usage: /qr <text or link>")
+        return
     
-    async with app:
-        await app.start()
-        await webserver.serve()
-        await app.stop()
+    text = ' '.join(context.args)
+    await update.message.reply_text(f"🔲 Generating QR code...")
+    
+    try:
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(text)
+        qr.make(fit=True)
+        
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        
+        qr_bytes = io.BytesIO()
+        qr_img.save(qr_bytes, format='PNG')
+        qr_bytes.seek(0)
+        
+        await update.message.reply_photo(
+            photo=qr_bytes,
+            caption="✅ QR Code generated"
+        )
+        
+    except Exception as e:
+        logger.error(f"QR generation error: {e}")
+        await update.message.reply_text("❌ Failed to generate QR code")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Extract text from QR in image
+async def qr_from_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please send an image containing a QR code")
+        return
+    
+    await update.message.reply_text("🔍 Scanning QR code from image...")
+    
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        files = {'file': ('qr.jpg', photo_bytes, 'image/jpeg')}
+        response = requests.post('https://api.qrserver.com/v1/read-qr-code/', files=files)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data[0]['symbol'][0]['data']:
+                qr_text = data[0]['symbol'][0]['data']
+                await update.message.reply_text(f"✅ QR Code contains:\n\n`{qr_text}`", parse_mode='Markdown')
+            else:
+                await update.message.reply_text("❌ No QR code found in the image")
+        else:
+            await update.message.reply_text("❌ Failed to read QR code")
+            
+    except Exception as e:
+        logger.error(f"QR decode error: {e}")
+        await update.message.reply_text("❌ Failed to read QR code from image")
+
+# Error handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.message:
+        await update.message.reply_text("❌ An error occurred. Please try again.")
+
+# Main function
+def main():
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("❌ No token found! Set TELEGRAM_BOT_TOKEN environment variable")
+        return
+    
+    logger.info("🤖 Starting bot...")
+    
+    application = Application.builder().token(token).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("done", done))
+    application.add_handler(CommandHandler("text2image", text2image))
+    application.add_handler(CommandHandler("qr", generate_qr))
+    application.add_handler(CommandHandler("img2qr", qr_from_image))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_error_handler(error_handler)
+    
+    # Start bot
+    logger.info("✅ Bot is running...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
